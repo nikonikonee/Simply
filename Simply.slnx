@@ -1,0 +1,9 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="Simply/Simply.vcxproj" Id="c3eb2eda-d229-4758-a20b-8509f582cdc4" />
+  <Project Path="SimplyBypass/SimplyBypass.vcxproj" Id="a1b2c3d4-0001-4000-8000-000000000001" />
+  <Project Path="TestTarget/TestTarget.vcxproj" Id="a1b2c3d4-0002-4000-8000-000000000002" />
+</Solution>

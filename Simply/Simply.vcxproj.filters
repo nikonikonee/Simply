@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\main.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\pe_inspector.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\debugger.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\peb_patcher.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\injector.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\oep_finder.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\dumper.cpp"><Filter>Source Files</Filter></ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\pe_inspector.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="include\debugger.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="include\peb_patcher.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="include\injector.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="include\oep_finder.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="include\dumper.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="include\simply_log.hpp"><Filter>Header Files</Filter></ClInclude>
+  </ItemGroup>
+</Project>
