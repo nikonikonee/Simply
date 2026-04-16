@@ -1,10 +1,9 @@
 #include "hooks.hpp"
+#include "hooker.hpp"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winternl.h>
-
-#include <MinHook.h>
 
 #include <atomic>
 #include <cstddef>
@@ -567,7 +566,7 @@ HWND NTAPI Hook_NtUserGetForegroundWindow() {
 }
 
 /*
-   KiUserExceptionDispatcher has no real call frame so MinHook's trampoline
+   KiUserExceptionDispatcher has no real call frame so a trampoline hook
    trashes the stack. RtlDispatchException is what it calls right after
    with a clean x64 ABI and the same CONTEXT* that __except filters see,
    so scrubbing DRx here makes themida's filters see zeros.
@@ -581,7 +580,7 @@ BOOLEAN NTAPI Hook_RtlDispatchException(PEXCEPTION_RECORD ex, PCONTEXT Ctx) {
 }
 
 VOID NTAPI Hook_DbgUiRemoteBreakin(PVOID Ctx) {
-    // themida overwrites this prologue so an external DebugActiveProcess hits themida's termination stub. hooking first preserves the real prologue in the MinHook trampoline
+    // themida overwrites this prologue so an external DebugActiveProcess hits themida's termination stub. hooking first preserves the real prologue in our trampoline
     real_DbgUiRemoteBreakin(Ctx);
 }
 
@@ -607,16 +606,14 @@ bool install_one(const wchar_t* module, const char* name, Fn hook, Fn& original_
     if (!h) return false;
     void* target = reinterpret_cast<void*>(GetProcAddress(h, name));
     if (!target) return false;
-    void* trampoline = nullptr;
-    if (MH_CreateHook(target, reinterpret_cast<void*>(hook), &trampoline) != MH_OK) return false;
-    original_out = reinterpret_cast<Fn>(trampoline);
-    return MH_EnableHook(target) == MH_OK;
+    return hooker::install(target, reinterpret_cast<void*>(hook),
+                           reinterpret_cast<void**>(&original_out));
 }
 
 }  // namespace
 
 bool install_hooks() {
-    if (MH_Initialize() != MH_OK) return false;
+    if (!hooker::initialize()) return false;
 
     bool ok = true;
     ok &= install_one(L"ntdll.dll",    "NtQueryInformationProcess", &Hook_NtQueryInformationProcess, real_NtQueryInformationProcess);
@@ -662,8 +659,7 @@ bool install_hooks() {
 }
 
 void uninstall_hooks() {
-    MH_DisableHook(MH_ALL_HOOKS);
-    MH_Uninitialize();
+    hooker::uninitialize();
 }
 
 }  // namespace simply::bypass

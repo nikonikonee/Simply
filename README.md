@@ -4,7 +4,7 @@ Automated Themida unpacker for Windows x64. Feed it a packed exe, get back a wor
 
 ## Build
 
-Open `Simply.slnx` in Visual Studio 2022, Release x64, build. Needs vcpkg (pulls in minhook for SimplyBypass).
+Open `Simply.slnx` in Visual Studio 2022, Release x64, build. No third-party dependencies: SimplyBypass ships its own x64 inline hook engine, and Simply parses the target PE by hand.
 
 ## Run
 
@@ -94,7 +94,9 @@ The fault classifier in `oep_finder.cpp` handles five cases:
 
 ### Anti-debug bypass
 
-`SimplyBypass` hooks a long list of `Nt*` and user32 calls through MinHook:
+`SimplyBypass` ships its own tiny x64 inline hook engine (`hooker.cpp`). Each hook patches the first bytes of the target with a 14-byte absolute jump (`FF 25 00 00 00 00 <qword>`) to the detour, and builds a trampoline that runs the overwritten prologue then jumps back to the rest of the function. A small length disassembler walks the prologue instructions to pick the patch boundary, and bails if it hits a RIP-relative or PC-relative operand (no relocation, no rewriting).
+
+Hooked functions:
 
 | target | purpose |
 |---|---|
@@ -128,5 +130,6 @@ Simply/
 
 SimplyBypass/
   dllmain.cpp               hidden-thread bootstrap
-  hooks.cpp                 MinHook anti-debug pack
+  hooker.cpp                x64 inline hook engine (abs jmp + trampoline + tiny LDE)
+  hooks.cpp                 anti-debug hook pack
 ```
