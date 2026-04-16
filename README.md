@@ -138,10 +138,10 @@ SimplyBypass/
 
 Same binary in IDA, before and after Simply.
 
-**Before** — packed by Themida Pro. `.text` is a 3-byte stub jumping into the VM, real code lives encrypted in `.themida`, imports are poisoned.
+**Before:** packed by Themida Pro. `.text` is a 3-byte stub jumping into the VM, real code lives encrypted in `.themida`, imports are poisoned.
 
 ![before](assets/before.png)
 
-**After** — `Simply.exe packed.exe out.exe`. Real OEP, reconstructed IAT, packer sections dropped, clean control flow.
+**After:** `Simply.exe packed.exe out.exe`. Real OEP, reconstructed IAT, packer sections dropped, clean control flow.
 
 ![after](assets/after.png)
