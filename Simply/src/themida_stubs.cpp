@@ -200,11 +200,22 @@ std::uint32_t rewrite_themida_stubs(std::vector<std::uint8_t>& image, std::uint6
         }
         log::warn("stubs: unresolved call at rva 0x{:x} -> stub 0x{:x}: {}",
                   text_base_rva + i, tgt_rva, hex);
+
+        /*
+         * neuter the site: overwrite the 5-byte E8/E9 disp32 with 0xCC.
+         * the common case is a themida EPV thunk that sat in .text to
+         * redirect the original EP; after we flip AddressOfEntryPoint to
+         * the real OEP that thunk is dead code. dropping the instruction
+         * kills the last xref into the packer section so section_cleaner
+         * can drop it, and if anything ever does execute here it'll raise
+         * EXCEPTION_BREAKPOINT instead of sliding into garbage.
+         */
+        std::memset(image.data() + t_off + i, 0xCC, 5);
     }
 
     if (resolved.empty()) {
         if (unresolved > 0) {
-            log::warn("stubs: {} call site(s) into packer section but none matched a known stub pattern - leaving alone", unresolved);
+            log::warn("stubs: {} call site(s) into packer section neutered with int3 (dead thunks)", unresolved);
         }
         return 0;
     }

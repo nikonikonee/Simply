@@ -11,6 +11,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -29,11 +30,16 @@ constexpr std::array<std::string_view, 9> kPackerNames = {
     ".enigma1"
 };
 
-// heavier VM-Macro dispatches can need a million+ single-steps to peel
-constexpr std::uint32_t kMaxStepsPerStub = 2'000'000;
+// events per stub: one CC hit per entered export. scaffolding chains
+// can easily ring up a few hundred, bound it so a pathological stub
+// can't pin us
+constexpr std::uint32_t kMaxEventsPerStub = 8192;
 
-// total wall budget so a pathological binary can't pin the host forever
-constexpr DWORD kTotalBudgetMs = 180'000;
+// wall budget per stub in case scaffolding does a blocking wait
+constexpr DWORD kPerStubBudgetMs = 5'000;
+
+// total wall budget so nothing pathological pins the host forever
+constexpr DWORD kTotalBudgetMs = 60'000;
 
 struct SectionRange {
     std::uint32_t lo_rva;
@@ -53,6 +59,11 @@ bool read_remote_bytes(HANDLE process, std::uint64_t addr, void* out, std::size_
     SIZE_T n = 0;
     return ReadProcessMemory(process, reinterpret_cast<LPCVOID>(addr), out, len, &n)
            && n == len;
+}
+
+bool write_remote_byte(HANDLE process, std::uint64_t addr, std::uint8_t b) {
+    SIZE_T n = 0;
+    return WriteProcessMemory(process, reinterpret_cast<LPVOID>(addr), &b, 1, &n) && n == 1;
 }
 
 bool is_packer_name(const IMAGE_SECTION_HEADER& s) {
@@ -185,24 +196,6 @@ std::vector<std::uint64_t> collect_stub_sites(HANDLE process, std::uint64_t imag
     return stubs;
 }
 
-bool set_trap_flag(HANDLE thread) {
-    CONTEXT ctx{};
-    ctx.ContextFlags = CONTEXT_CONTROL;
-    if (!GetThreadContext(thread, &ctx)) return false;
-    ctx.EFlags |= 0x100;  // TF
-    ctx.ContextFlags = CONTEXT_CONTROL;
-    return SetThreadContext(thread, &ctx) != 0;
-}
-
-bool read_rip_rsp(HANDLE thread, std::uint64_t& rip, std::uint64_t& rsp) {
-    CONTEXT ctx{};
-    ctx.ContextFlags = CONTEXT_CONTROL;
-    if (!GetThreadContext(thread, &ctx)) return false;
-    rip = ctx.Rip;
-    rsp = ctx.Rsp;
-    return true;
-}
-
 struct ModuleRange {
     std::uint64_t base;
     std::uint64_t end;
@@ -237,109 +230,105 @@ const ModuleRange* find_module(std::uint64_t rip, const std::vector<ModuleRange>
     return nullptr;
 }
 
-bool rip_in_module(std::uint64_t rip, const std::vector<ModuleRange>& mods) {
+/*
+   plant 0xCC at every exported function in every external module. themida
+   stubs dispatch to real apis via tail-jmp; the api's first byte is the CC
+   that raises EXCEPTION_BREAKPOINT and pins the landing in one event
+   instead of millions of single-steps.
+
+   forwarded exports (AddressOfFunctions entry that falls inside the export
+   directory blob) are RVAs of forwarder strings, not code, so skip them.
+ */
+std::unordered_map<std::uint64_t, std::uint8_t>
+plant_export_breakpoints(HANDLE process, const std::vector<ModuleRange>& mods) {
+    std::unordered_map<std::uint64_t, std::uint8_t> out;
     for (const auto& m : mods) {
-        if (rip >= m.base && rip < m.end) return true;
+        IMAGE_DOS_HEADER dos{};
+        if (!read_remote(process, m.base, dos)) continue;
+        if (dos.e_magic != IMAGE_DOS_SIGNATURE) continue;
+        IMAGE_NT_HEADERS64 nt{};
+        if (!read_remote(process, m.base + dos.e_lfanew, nt)) continue;
+        if (nt.Signature != IMAGE_NT_SIGNATURE) continue;
+        const auto& dd = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (!dd.Size || !dd.VirtualAddress) continue;
+        IMAGE_EXPORT_DIRECTORY exp{};
+        if (!read_remote(process, m.base + dd.VirtualAddress, exp)) continue;
+        if (!exp.NumberOfFunctions || exp.NumberOfFunctions > (1u << 20)) continue;
+        std::vector<DWORD> rvas(exp.NumberOfFunctions);
+        if (!read_remote_bytes(process, m.base + exp.AddressOfFunctions,
+                               rvas.data(), rvas.size() * sizeof(DWORD))) continue;
+        const DWORD exp_lo = dd.VirtualAddress;
+        const DWORD exp_hi = dd.VirtualAddress + dd.Size;
+        for (DWORD r : rvas) {
+            if (!r) continue;
+            if (r >= exp_lo && r < exp_hi) continue;  // forwarder string
+            const std::uint64_t va = m.base + r;
+            if (out.count(va)) continue;
+            std::uint8_t orig = 0;
+            if (!read_remote(process, va, orig)) continue;
+            if (orig == 0xCC) continue;  // somebody else's trap, leave alone
+            if (!write_remote_byte(process, va, 0xCC)) continue;
+            out[va] = orig;
+        }
     }
-    return false;
+    FlushInstructionCache(process, nullptr, 0);
+    return out;
+}
+
+void restore_export_breakpoints(HANDLE process,
+                                const std::unordered_map<std::uint64_t, std::uint8_t>& bps) {
+    for (const auto& [va, orig] : bps) {
+        write_remote_byte(process, va, orig);
+    }
+    FlushInstructionCache(process, nullptr, 0);
+}
+
+// DR0 one-shot exec BP on stub entry so we can anchor rsp AT the stub's
+// first byte without the ntdll bootstrap (which may hit planted CCs on
+// its own way into stub) polluting the anchor.
+bool arm_dr0(HANDLE thread, std::uint64_t va) {
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(thread, &ctx)) return false;
+    ctx.Dr0 = va;
+    ctx.Dr6 = 0;
+    // clear slot 0 fields (L0, G0, L/R type+len), set L0=1 (exec, len=1 -> all zeros)
+    ctx.Dr7 &= ~(0x000F0003ULL);
+    ctx.Dr7 |= 0x00000001ULL;
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    return SetThreadContext(thread, &ctx) != 0;
 }
 
 /*
-   single-step until RIP lands in a system DLL via a tail-jmp (stub's last
-   act was `jmp <real_api>`, not `call <wrapper_helper>`). returns 0 on
-   no-capture.
+   run the stub once and catch the landing via the planted CC carpet.
 
-   gotchas:
-     1. a freshly-resumed remote thread starts at ntdll!RtlUserThreadStart,
-        not our requested start address (the OS bootstraps every thread
-        through that wrapper). wait for RIP to enter the target image (our
-        stub running) before treating system-DLL RIPs as captures.
-     2. themida stubs commonly call scaffolding apis (Sleep(0), GetTickCount,
-        anti-debug helpers) BEFORE the final dispatch jmp. naively returning
-        the first system-DLL RIP catches the wrapper, not the target. anchor
-        RSP at the moment we first observe RIP in user code, only accept
-        system-DLL transitions where RSP matches that anchor (or is one
-        slot below, allowing for a ret addr push some stubs leave on the
-        stack). nested call wrappers push further down and fail this check.
+   flow:
+     pre-anchor:
+       spawn suspended at stub_va, arm DR0 at stub_va so we can pin the
+       stub's actual entry rsp. any CC hits that come in during ntdll's
+       bootstrap are nested by definition -> restore/TF/replant, don't
+       classify.
+     anchor:
+       DR0 fires as SINGLE_STEP at RIP==stub_va. snapshot rsp, that's our
+       anchor_rsp. clear DR0. switch phase.
+     anchored:
+       each CC hit at an api entry:
+         rsp == anchor_rsp AND [rsp] outside target -> tail-jmp capture.
+         else -> scaffolding or nested api->api:
+           rewind RIP, restore original byte, set TF, continue. on the
+           following SINGLE_STEP, replant CC at that va and clear pending.
+
+   capture logic mirrors the original TF design: ret_addr in target vs not,
+   just implemented on top of CC events. rsp equality gates out nested
+   api->api transitions (inside Sleep calls NtDelayExecution) that'd
+   otherwise look like tail-jmps.
  */
-std::uint64_t step_until_exit(HANDLE process, HANDLE thread, DWORD remote_tid, const std::vector<ModuleRange>& sys_mods, std::uint64_t target_base, std::uint64_t target_end, DWORD deadline_tick) {
-    DEBUG_EVENT ev{};
-    std::uint32_t steps = 0;
-    bool in_user_yet = false;
-    bool prev_in_target = false;
-    while (steps < kMaxStepsPerStub) {
-        if (GetTickCount() > deadline_tick) {
-            log::warn("capture: budget exhausted mid-stub");
-            return 0;
-        }
-        if (!WaitForDebugEvent(&ev, 5'000)) {
-            log::warn("capture: WaitForDebugEvent timed out (last err {})", GetLastError());
-            return 0;
-        }
-        DWORD cs = DBG_CONTINUE;
+enum class Phase { PreAnchor, Anchored };
 
-        if (ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
-            const auto& er = ev.u.Exception.ExceptionRecord;
-            if (ev.dwThreadId == remote_tid &&
-                er.ExceptionCode == EXCEPTION_SINGLE_STEP) {
-                std::uint64_t rip = 0, rsp = 0;
-                const bool got = read_rip_rsp(thread, rip, rsp);
-                const bool in_target = got && rip >= target_base && rip < target_end;
-                const bool in_sys = got && rip_in_module(rip, sys_mods);
-                if (in_target && !in_user_yet) in_user_yet = true;
-                /*
-                 * classify only at the exact target->system transition.
-                 * [rsp] inside target means stub pushed a return for a
-                 * helper call (scaffolding, keep stepping). [rsp] outside
-                 * target means stub did a tail jmp to the real api (capture).
-                 */
-                if (in_user_yet && in_sys && prev_in_target) {
-                    std::uint64_t ret_addr = 0;
-                    const bool ret_ok = read_remote(process, rsp, ret_addr);
-                    const bool scaffolding =
-                        ret_ok && ret_addr >= target_base && ret_addr < target_end;
-                    if (!scaffolding) {
-                        SuspendThread(thread);
-                        ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
-                        return rip;
-                    }
-                }
-                prev_in_target = in_target;
-                if (!set_trap_flag(thread)) {
-                    log::warn("capture: SetThreadContext failed: {}", GetLastError());
-                    ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
-                    return 0;
-                }
-                ++steps;
-                cs = DBG_CONTINUE;
-            } else if (ev.dwThreadId == remote_tid) {
-                log::debug("capture: remote thread fault 0x{:x} at 0x{:x}, abandoning",
-                           er.ExceptionCode,
-                           reinterpret_cast<std::uintptr_t>(er.ExceptionAddress));
-                ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
-                return 0;
-            } else {
-                cs = DBG_EXCEPTION_NOT_HANDLED;
-            }
-        } else if (ev.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT &&
-                   ev.dwThreadId == remote_tid) {
-            return 0;
-        } else if (ev.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) {
-            log::warn("capture: target exited mid-capture");
-            ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
-            return 0;
-        }
-
-        if (!ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, cs)) {
-            log::warn("capture: ContinueDebugEvent failed: {}", GetLastError());
-            return 0;
-        }
-    }
-    log::warn("capture: stub exceeded {} steps without leaving image", kMaxStepsPerStub);
-    return 0;
-}
-
-std::uint64_t capture_one(HANDLE process_handle, std::uint64_t stub_va, const std::vector<ModuleRange>& sys_mods, std::uint64_t target_base, std::uint64_t target_end, DWORD deadline_tick) {
+std::uint64_t capture_one(HANDLE process_handle, std::uint64_t stub_va,
+                          const std::unordered_map<std::uint64_t, std::uint8_t>& bps,
+                          std::uint64_t target_base, std::uint64_t target_end,
+                          DWORD deadline_tick) {
     DWORD tid = 0;
     HANDLE remote = CreateRemoteThread(
         process_handle, nullptr, 0,
@@ -350,39 +339,158 @@ std::uint64_t capture_one(HANDLE process_handle, std::uint64_t stub_va, const st
         return 0;
     }
 
-    // creating a thread under a debugger queues a CREATE_THREAD_DEBUG_EVENT,
-    // pump it before we resume so the loop below sees only steps
-    DEBUG_EVENT ev{};
-    while (WaitForDebugEvent(&ev, 1'000)) {
-        const bool is_create_for_us =
-            ev.dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT && ev.dwThreadId == tid;
-        ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
-        if (is_create_for_us) break;
-        if (GetTickCount() > deadline_tick) {
-            TerminateThread(remote, 0);
-            CloseHandle(remote);
-            return 0;
-        }
-    }
-
-    if (!set_trap_flag(remote)) {
-        log::warn("capture: failed to set TF on remote thread: {}", GetLastError());
+    /*
+       don't drain CREATE_THREAD_DEBUG_EVENT here. on CREATE_SUSPENDED it
+       may not queue until ResumeThread, which burns the full 1s timeout
+       for every stub. SetThreadContext works on suspended threads without
+       the thread having entered the debugger's attention yet, so arm DR0
+       now, resume, and handle CREATE_THREAD in the main event loop as a
+       pass-through.
+     */
+    if (!arm_dr0(remote, stub_va)) {
+        log::warn("capture: arm_dr0 failed on remote thread: {}", GetLastError());
         TerminateThread(remote, 0);
         CloseHandle(remote);
         return 0;
     }
     ResumeThread(remote);
+    DEBUG_EVENT ev{};
 
-    const std::uint64_t api_va = step_until_exit(process_handle, remote, tid, sys_mods, target_base, target_end, deadline_tick);
+    Phase phase = Phase::PreAnchor;
+    std::uint64_t anchor_rsp = 0;
+    std::uint64_t pending_replant = 0;
+    std::uint32_t events = 0;
+    std::uint64_t captured = 0;
+    const DWORD per_stub_deadline = (std::min)(
+        static_cast<DWORD>(GetTickCount() + kPerStubBudgetMs), deadline_tick);
+
+    while (events < kMaxEventsPerStub && captured == 0) {
+        if (GetTickCount() > per_stub_deadline) {
+            log::debug("capture: per-stub budget exhausted for 0x{:x}", stub_va);
+            break;
+        }
+        if (!WaitForDebugEvent(&ev, 1'000)) {
+            // thread may be blocked in a scaffolding api; abandon this stub
+            log::debug("capture: WaitForDebugEvent idle on stub 0x{:x}", stub_va);
+            break;
+        }
+        DWORD cs = DBG_CONTINUE;
+
+        if (ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
+            const auto& er = ev.u.Exception.ExceptionRecord;
+            const std::uint64_t exc_addr =
+                reinterpret_cast<std::uint64_t>(er.ExceptionAddress);
+            const bool ours = (ev.dwThreadId == tid);
+
+            if (ours && er.ExceptionCode == EXCEPTION_BREAKPOINT) {
+                auto it = bps.find(exc_addr);
+                if (it != bps.end()) {
+                    CONTEXT ctx{};
+                    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+                    if (!GetThreadContext(remote, &ctx)) {
+                        cs = DBG_CONTINUE;
+                    } else {
+                        // CC fired with RIP one past the byte; rewind so the
+                        // restored instruction executes from its real head
+                        ctx.Rip = exc_addr;
+
+                        bool do_capture = false;
+                        if (phase == Phase::Anchored && ctx.Rsp == anchor_rsp) {
+                            std::uint64_t ret_addr = 0;
+                            const bool ok = read_remote(process_handle, ctx.Rsp, ret_addr);
+                            const bool scaffolding =
+                                ok && ret_addr >= target_base && ret_addr < target_end;
+                            if (!scaffolding) do_capture = true;
+                        }
+
+                        if (do_capture) {
+                            captured = exc_addr;
+                            // suspend before continue so the thread stays
+                            // frozen at the BP after we release the debug
+                            // wait; terminate then fires EXIT_THREAD cleanly
+                            // without the CC-at-RIP retry loop
+                            SuspendThread(remote);
+                            ctx.ContextFlags = CONTEXT_CONTROL;
+                            SetThreadContext(remote, &ctx);
+                        } else {
+                            // scaffolding (stub -> api) or nested (api -> api)
+                            // or pre-anchor bootstrap CC: restore byte, TF, and
+                            // replant after the one-step
+                            write_remote_byte(process_handle, exc_addr, it->second);
+                            ctx.EFlags |= 0x100;
+                            ctx.ContextFlags = CONTEXT_CONTROL;
+                            SetThreadContext(remote, &ctx);
+                            pending_replant = exc_addr;
+                        }
+                    }
+                } else {
+                    // not one of ours; let the target's SEH see it
+                    cs = DBG_EXCEPTION_NOT_HANDLED;
+                }
+                ++events;
+            } else if (ours && er.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+                if (phase == Phase::PreAnchor) {
+                    CONTEXT ctx{};
+                    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
+                    if (GetThreadContext(remote, &ctx) && ctx.Rip == stub_va) {
+                        // DR0 fired at stub entry, this is our anchor
+                        anchor_rsp = ctx.Rsp;
+                        phase = Phase::Anchored;
+                        ctx.Dr0 = 0;
+                        ctx.Dr6 = 0;
+                        ctx.Dr7 &= ~(0x000F0003ULL);
+                        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                        SetThreadContext(remote, &ctx);
+                    }
+                }
+                // TF fires after we restore a CC and step one instruction,
+                // regardless of phase. replant if we have one pending.
+                if (pending_replant) {
+                    write_remote_byte(process_handle, pending_replant, 0xCC);
+                    pending_replant = 0;
+                }
+                ++events;
+            } else if (ours) {
+                // remote thread took an unrelated fault: just bail
+                log::debug("capture: stub 0x{:x} faulted 0x{:x} at 0x{:x}",
+                           stub_va, er.ExceptionCode, exc_addr);
+                cs = DBG_CONTINUE;
+                ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, cs);
+                break;
+            } else {
+                cs = DBG_EXCEPTION_NOT_HANDLED;
+            }
+        } else if (ev.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT &&
+                   ev.dwThreadId == tid) {
+            ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
+            break;
+        } else if (ev.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) {
+            log::warn("capture: target exited mid-capture");
+            ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
+            CloseHandle(remote);
+            return 0;
+        }
+
+        if (!ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, cs)) {
+            log::warn("capture: ContinueDebugEvent failed: {}", GetLastError());
+            break;
+        }
+    }
+
+    // if we captured (or gave up) while a restore was outstanding, put the
+    // CC back before any other thread could execute that api
+    if (pending_replant) {
+        write_remote_byte(process_handle, pending_replant, 0xCC);
+        pending_replant = 0;
+    }
 
     TerminateThread(remote, 0);
-    // drain the EXIT_THREAD from TerminateThread so the queue is clean
-    while (WaitForDebugEvent(&ev, 500)) {
+    while (WaitForDebugEvent(&ev, 100)) {
         ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
         if (ev.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT && ev.dwThreadId == tid) break;
     }
     CloseHandle(remote);
-    return api_va;
+    return captured;
 }
 
 }  // namespace
@@ -416,18 +524,50 @@ CaptureResult capture_api_landings(void* process_handle, std::uint64_t image_bas
         log::warn("capture: failed to enumerate system modules");
         return out;
     }
+
+    const DWORD plant_start = GetTickCount();
+    const auto bps = plant_export_breakpoints(process, sys_mods);
+    if (bps.empty()) {
+        log::warn("capture: couldn't plant any export breakpoints");
+        return out;
+    }
+    log::info("capture: planted {} export breakpoints across {} module(s) in {}ms",
+              bps.size(), sys_mods.size(), GetTickCount() - plant_start);
+
+    /*
+       strip PAGE_EXECUTE on .text for the duration of capture. main.cpp
+       disarms the OEP DEP trap before calling us (the TF-step approach
+       expected to walk through .text helpers freely); with the CC approach
+       we run stubs at native speed between events, so a stub that tail-jmps
+       into user code (the CRT bootstrap dispatcher among the poisoned
+       slots will literally run main) would race the program to completion.
+       strip exec here, treat an AV in our remote thread as "stub dispatched
+       into user code" and abandon that stub. the AV is naturally handled
+       by the generic unrelated-fault arm in capture_one.
+     */
+    const std::uint64_t text_va = image_base + text.lo_rva;
+    const std::uint32_t text_size = text.hi_rva - text.lo_rva;
+    DWORD old_text_prot = 0;
+    const bool text_stripped = VirtualProtectEx(
+        process, reinterpret_cast<LPVOID>(text_va), text_size,
+        PAGE_READONLY, &old_text_prot) != 0;
+    if (!text_stripped) {
+        log::warn("capture: couldn't strip .text exec for guard: {}", GetLastError());
+    }
+
     const DWORD deadline = GetTickCount() + kTotalBudgetMs;
     const std::uint64_t target_end = image_base + size_of_image;
 
     std::uint32_t resolved = 0;
     const std::size_t total = stub_set.size();
+    const DWORD capture_start = GetTickCount();
     for (const auto stub_va : stub_set) {
         if (GetTickCount() > deadline) {
             log::warn("capture: total budget exceeded after {}/{} stubs", resolved, total);
             break;
         }
         const std::uint64_t api_va = capture_one(
-            process, stub_va, sys_mods, image_base, target_end, deadline);
+            process, stub_va, bps, image_base, target_end, deadline);
         if (api_va) {
             out.stub_to_api[stub_va] = api_va;
             ++resolved;
@@ -441,7 +581,15 @@ CaptureResult capture_api_landings(void* process_handle, std::uint64_t image_bas
             log::warn("capture: stub 0x{:x} unresolved", stub_va);
         }
     }
-    log::info("capture: resolved {}/{} stub(s)", resolved, total);
+    log::info("capture: resolved {}/{} stub(s) in {}ms",
+              resolved, total, GetTickCount() - capture_start);
+
+    if (text_stripped) {
+        DWORD tmp = 0;
+        VirtualProtectEx(process, reinterpret_cast<LPVOID>(text_va), text_size,
+                         old_text_prot, &tmp);
+    }
+    restore_export_breakpoints(process, bps);
     return out;
 }
 
