@@ -147,10 +147,9 @@ void rebase_image(std::vector<std::uint8_t>& image, std::uint64_t old_base, std:
 
 }  // namespace
 
-bool dump_image(void* process_handle, std::uint64_t image_base, std::uint64_t preferred_image_base, std::uint32_t size_of_image, std::uint64_t oep_va, const std::filesystem::path& output_path, const CaptureResult* capture) {
+std::vector<std::uint8_t> snapshot_image(void* process_handle, std::uint64_t image_base, std::uint32_t size_of_image) {
     auto* process = static_cast<HANDLE>(process_handle);
 
-    // snapshot the whole image as the loader laid it out; sections keep their virtual layout
     std::vector<std::uint8_t> buffer(size_of_image, 0);
 
     std::size_t bytes_read = 0;
@@ -185,6 +184,12 @@ bool dump_image(void* process_handle, std::uint64_t image_base, std::uint64_t pr
         cursor = region_end;
     }
 
+    log::debug("snapshot: {} bytes read from runtime image, {} unreadable region(s)",
+               bytes_read, holes);
+    return buffer;
+}
+
+bool dump_image(const ModuleSnapshot& snap, std::vector<std::uint8_t> buffer, std::uint64_t image_base, std::uint64_t preferred_image_base, std::uint32_t size_of_image, std::uint64_t oep_va, const std::filesystem::path& output_path, const CaptureResult* capture) {
     if (oep_va < image_base) {
         log::error("rebuild: OEP 0x{:x} is below image base 0x{:x}", oep_va, image_base);
         return false;
@@ -192,7 +197,7 @@ bool dump_image(void* process_handle, std::uint64_t image_base, std::uint64_t pr
     const auto oep_rva = static_cast<std::uint32_t>(oep_va - image_base);
 
     // rebuild imports BEFORE header fixup so the new section's raw size gets aligned by the header pass
-    rebuild_iat(process_handle, buffer, image_base);
+    rebuild_iat(snap, buffer, image_base);
 
     if (!fix_pe_headers(buffer, oep_rva)) return false;
 
@@ -204,7 +209,7 @@ bool dump_image(void* process_handle, std::uint64_t image_base, std::uint64_t pr
     std::unordered_map<std::uint64_t, std::uint32_t> stub_iat_overrides;
     if (capture && !capture->stub_to_api.empty()) {
         const auto api_to_iat = extend_iat_for_captures(
-            process_handle, buffer, image_base, capture->stub_to_api);
+            snap, buffer, image_base, capture->stub_to_api);
         // join: stub_va -> api_va -> iat_rva
         for (const auto& [stub_va, api_va] : capture->stub_to_api) {
             auto it = api_to_iat.find(api_va);
@@ -220,7 +225,7 @@ bool dump_image(void* process_handle, std::uint64_t image_base, std::uint64_t pr
      * `mov rax,[slot]; call rax` works as-is
      */
     if (capture && !capture->slot_to_stub.empty() && !capture->stub_to_api.empty()) {
-        rebind_poisoned_slots(process_handle, buffer, image_base,
+        rebind_poisoned_slots(snap, buffer, image_base,
                               capture->slot_to_stub, capture->stub_to_api);
     }
 
@@ -256,8 +261,7 @@ bool dump_image(void* process_handle, std::uint64_t image_base, std::uint64_t pr
         return false;
     }
 
-    log::info("dumped {} bytes to {} ({} unreadable region(s) zeroed)",
-              bytes_read, output_path.string(), holes);
+    log::info("dumped {} bytes to {}", buffer.size(), output_path.string());
     log::info("rebuilt PE: entry_point=0x{:x} (RVA 0x{:x})",
               preferred_image_base + oep_rva, oep_rva);
     return true;

@@ -198,24 +198,21 @@ std::uint32_t rewrite_themida_stubs(std::vector<std::uint8_t>& image, std::uint6
         for (std::size_t k = 0; k < dump_len; ++k) {
             std::snprintf(hex + 3 * k, 4, "%02X ", image[tgt_rva + k]);
         }
-        log::warn("stubs: unresolved call at rva 0x{:x} -> stub 0x{:x}: {}",
-                  text_base_rva + i, tgt_rva, hex);
+        log::debug("stubs: unresolved call at rva 0x{:x} -> stub 0x{:x}: {}",
+                   text_base_rva + i, tgt_rva, hex);
 
         /*
-         * neuter the site: overwrite the 5-byte E8/E9 disp32 with 0xCC.
-         * the common case is a themida EPV thunk that sat in .text to
-         * redirect the original EP; after we flip AddressOfEntryPoint to
-         * the real OEP that thunk is dead code. dropping the instruction
-         * kills the last xref into the packer section so section_cleaner
-         * can drop it, and if anything ever does execute here it'll raise
-         * EXCEPTION_BREAKPOINT instead of sliding into garbage.
+         * leave the site untouched. themida 3.x VM-Macro stubs implement
+         * actual logic and return values into .text, so neutering with int3
+         * makes the dump crash on first reach. the original E8/E9 disp32
+         * still points into .themida, which keeps section_cleaner's xref
+         * count > 0 so the packer section content is preserved.
          */
-        std::memset(image.data() + t_off + i, 0xCC, 5);
     }
 
     if (resolved.empty()) {
         if (unresolved > 0) {
-            log::warn("stubs: {} call site(s) into packer section neutered with int3 (dead thunks)", unresolved);
+            log::warn("stubs: {} call site(s) into packer section unresolved (left intact, .themida content preserved)", unresolved);
         }
         return 0;
     }

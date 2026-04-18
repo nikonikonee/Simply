@@ -36,6 +36,17 @@ struct ResolvedImport {
 
 using ExportMap = std::unordered_map<std::uint64_t, ResolvedImport>;
 
+}  // namespace
+
+struct ModuleSnapshot {
+    std::vector<ModuleInfo> modules;
+    ExportMap               exports;
+};
+
+void ModuleSnapshotDeleter::operator()(ModuleSnapshot* p) const noexcept { delete p; }
+
+namespace {
+
 // one contiguous run of IAT pointers in the dump
 struct IatRun {
     std::uint32_t              rva       = 0;
@@ -303,9 +314,20 @@ void pad_to(std::vector<std::uint8_t>& out, std::size_t alignment) {
 
 }  // namespace
 
-bool rebuild_iat(void* process_handle, std::vector<std::uint8_t>& image, std::uint64_t image_base) {
+ModuleSnapshotPtr snapshot_modules(void* process_handle) {
     auto* process = static_cast<HANDLE>(process_handle);
+    auto modules = enum_modules(process);
+    if (modules.empty()) {
+        log::error("snapshot: no modules enumerated in target");
+        return nullptr;
+    }
+    auto exports = build_export_map(process, modules);
+    log::debug("snapshot: captured {} modules with {} exports",
+               modules.size(), exports.size());
+    return ModuleSnapshotPtr(new ModuleSnapshot{std::move(modules), std::move(exports)});
+}
 
+bool rebuild_iat(const ModuleSnapshot& snap, std::vector<std::uint8_t>& image, std::uint64_t image_base) {
     if (image.size() < sizeof(IMAGE_DOS_HEADER)) {
         log::error("iat: image too small");
         return false;
@@ -318,13 +340,13 @@ bool rebuild_iat(void* process_handle, std::vector<std::uint8_t>& image, std::ui
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(image.data() + nt_off);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
 
-    auto modules = enum_modules(process);
+    const auto& modules = snap.modules;
+    const auto& exports = snap.exports;
     if (modules.empty()) {
-        log::error("iat: no modules enumerated in target");
+        log::error("iat: snapshot has no modules");
         return false;
     }
-    const auto exports = build_export_map(process, modules);
-    log::debug("iat: collected {} exports across {} modules", exports.size(), modules.size());
+    log::debug("iat: using {} exports across {} modules", exports.size(), modules.size());
 
     auto runs = find_iat_runs(image, image_base, exports);
     if (runs.empty()) {
@@ -414,15 +436,31 @@ bool rebuild_iat(void* process_handle, std::vector<std::uint8_t>& image, std::ui
     auto* dos2 = reinterpret_cast<IMAGE_DOS_HEADER*>(image.data());
     auto* nt2  = reinterpret_cast<IMAGE_NT_HEADERS*>(image.data() + dos2->e_lfanew);
 
-    // need room for one more section header between the table and the first section
+    // need room for one more section header between the table and the first section.
+    // tightly packed PEs (e.g. putty) have SizeOfHeaders only just past the existing
+    // section table, but the runtime headers page is zero-padded all the way up to
+    // the first section's VirtualAddress. bump SizeOfHeaders into that slack instead
+    // of bailing - fix_pe_headers later aligns it up to section alignment anyway.
     auto* section_table = IMAGE_FIRST_SECTION(nt2);
     const unsigned section_count = nt2->FileHeader.NumberOfSections;
+    const std::uintptr_t image_base_addr = reinterpret_cast<std::uintptr_t>(image.data());
     const std::uintptr_t section_table_end = reinterpret_cast<std::uintptr_t>(section_table + section_count);
-    const std::uintptr_t headers_end =
-        reinterpret_cast<std::uintptr_t>(image.data()) + nt2->OptionalHeader.SizeOfHeaders;
-    if (section_table_end + sizeof(IMAGE_SECTION_HEADER) > headers_end) {
-        log::error("iat: no room in PE headers for an extra section header");
-        return false;
+    const std::uint32_t needed_headers_size = static_cast<std::uint32_t>(
+        section_table_end + sizeof(IMAGE_SECTION_HEADER) - image_base_addr);
+    if (needed_headers_size > nt2->OptionalHeader.SizeOfHeaders) {
+        std::uint32_t first_section_rva = UINT32_MAX;
+        for (unsigned s = 0; s < section_count; ++s) {
+            const std::uint32_t va = section_table[s].VirtualAddress;
+            if (va < first_section_rva) first_section_rva = va;
+        }
+        if (needed_headers_size > first_section_rva) {
+            log::error("iat: no room in PE headers for an extra section header (need 0x{:x}, first section at 0x{:x})",
+                       needed_headers_size, first_section_rva);
+            return false;
+        }
+        log::debug("iat: bumped SizeOfHeaders 0x{:x} -> 0x{:x} to fit new section header",
+                   nt2->OptionalHeader.SizeOfHeaders, needed_headers_size);
+        nt2->OptionalHeader.SizeOfHeaders = needed_headers_size;
     }
 
     IMAGE_SECTION_HEADER& new_sec = section_table[section_count];
@@ -474,9 +512,8 @@ IMAGE_SECTION_HEADER* find_simply_section(IMAGE_NT_HEADERS64* nt) {
 }  // namespace
 
 std::unordered_map<std::uint64_t, std::uint32_t>
-extend_iat_for_captures(void* process_handle, std::vector<std::uint8_t>& image, std::uint64_t /*image_base*/, const std::unordered_map<std::uint64_t, std::uint64_t>& landings) {
+extend_iat_for_captures(const ModuleSnapshot& snap, std::vector<std::uint8_t>& image, std::uint64_t /*image_base*/, const std::unordered_map<std::uint64_t, std::uint64_t>& landings) {
     std::unordered_map<std::uint64_t, std::uint32_t> out;
-    auto* process = static_cast<HANDLE>(process_handle);
 
     if (landings.empty()) return out;
     if (image.size() < sizeof(IMAGE_DOS_HEADER)) return out;
@@ -493,10 +530,9 @@ extend_iat_for_captures(void* process_handle, std::vector<std::uint8_t>& image, 
         return out;
     }
 
-    // resolve each api_va -> (module, func_name), dedupe by api_va per module
-    auto modules = enum_modules(process);
+    const auto& modules = snap.modules;
+    const auto& exports = snap.exports;
     if (modules.empty()) return out;
-    const auto exports = build_export_map(process, modules);
 
     /*
      * themida VM stubs often land at an interior offset of the target
@@ -724,9 +760,8 @@ extend_iat_for_captures(void* process_handle, std::vector<std::uint8_t>& image, 
     return out;
 }
 
-std::uint32_t rebind_poisoned_slots(void* process_handle, std::vector<std::uint8_t>& image, std::uint64_t image_base, const std::unordered_map<std::uint64_t, std::uint64_t>& slot_to_stub, const std::unordered_map<std::uint64_t, std::uint64_t>& stub_to_api) {
+std::uint32_t rebind_poisoned_slots(const ModuleSnapshot& snap, std::vector<std::uint8_t>& image, std::uint64_t image_base, const std::unordered_map<std::uint64_t, std::uint64_t>& slot_to_stub, const std::unordered_map<std::uint64_t, std::uint64_t>& stub_to_api) {
 
-    auto* process = static_cast<HANDLE>(process_handle);
     if (slot_to_stub.empty() || stub_to_api.empty()) return 0;
     if (image.size() < sizeof(IMAGE_DOS_HEADER)) return 0;
 
@@ -742,9 +777,9 @@ std::uint32_t rebind_poisoned_slots(void* process_handle, std::vector<std::uint8
         return 0;
     }
 
-    auto modules = enum_modules(process);
+    const auto& modules = snap.modules;
+    const auto& exports = snap.exports;
     if (modules.empty()) return 0;
-    const auto exports = build_export_map(process, modules);
 
     // nearest-lower fallback for interior captures (body of function, map to containing export)
     std::vector<std::vector<std::uint64_t>> module_export_vas(modules.size());

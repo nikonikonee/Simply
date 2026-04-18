@@ -239,50 +239,36 @@ int main(int argc, char** argv) {
             // disarm DEP so a remote thread straying into .text doesn't fault mid-step
             simply::disarm_oep_trap(dbg.process_handle(), trap);
             /*
-             * snapshot writable pages in the target image. TF-stepping through
-             * scaffolding calls like _initterm_e iterates static init callbacks,
-             * which writes to .data (CRT startup locks, etc). restore post-capture
-             * so the dump sees pristine .data
+             * snapshot the entire image NOW, before capture runs anything. capture
+             * spawns remote threads that can crash the target (themida watchdogs,
+             * stub bodies that ExitProcess out of context, etc). taking the bytes
+             * here means the dump survives even if capture takes the process down.
+             * threads are still suspended so .data is pristine for the snapshot.
              */
-            std::vector<std::pair<std::uintptr_t, std::vector<std::uint8_t>>> data_snapshot;
-            {
-                const std::uintptr_t img_end = runtime_image_base + info->size_of_image;
-                std::uintptr_t addr = runtime_image_base;
-                while (addr < img_end) {
-                    MEMORY_BASIC_INFORMATION mbi{};
-                    if (!VirtualQueryEx(dbg.process_handle(), reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)))
-                        break;
-                    const std::uintptr_t region_end =
-                        reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-                    const DWORD writable_mask =
-                        PAGE_READWRITE | PAGE_WRITECOPY |
-                        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-                    if (mbi.State == MEM_COMMIT && (mbi.Protect & writable_mask)) {
-                        std::vector<std::uint8_t> buf(mbi.RegionSize);
-                        SIZE_T got = 0;
-                        if (ReadProcessMemory(dbg.process_handle(), mbi.BaseAddress, buf.data(), buf.size(), &got) && got > 0) {
-                            buf.resize(got);
-                            data_snapshot.emplace_back(
-                                reinterpret_cast<std::uintptr_t>(mbi.BaseAddress),
-                                std::move(buf));
-                        }
-                    }
-                    addr = region_end;
-                }
-                simply::log::debug("snapshotted {} writable region(s) pre-capture", data_snapshot.size());
+            std::vector<std::uint8_t> image_snapshot = simply::snapshot_image(
+                dbg.process_handle(), runtime_image_base, info->size_of_image);
+            /*
+             * snapshot the loaded modules + their export tables here too. if
+             * capture kills the target, EnumProcessModulesEx fails 299 against
+             * a dead handle and the entire IAT pipeline silently no-ops,
+             * leaving runtime API VAs baked into the dumped code. taking it
+             * before capture means rebuild_iat / extend / rebind all still
+             * work on a dead process.
+             */
+            simply::ModuleSnapshotPtr module_snap = simply::snapshot_modules(dbg.process_handle());
+            if (!module_snap) {
+                simply::log::error("failed to snapshot target modules; cannot rebuild imports");
+                for (HANDLE h : pinned) CloseHandle(h);
+                TerminateProcess(dbg.process_handle(), 1);
+                return EXIT_FAILURE;
             }
             if (!dbg.release_pending(DBG_CONTINUE)) {
                 simply::log::warn("couldn't release OEP fault, skipping capture");
             } else {
                 capture = simply::capture_api_landings(dbg.process_handle(), runtime_image_base, info->size_of_image);
             }
-            // restore writable pages so dump sees pristine data
-            for (auto& [base, buf] : data_snapshot) {
-                SIZE_T wrote = 0;
-                WriteProcessMemory(dbg.process_handle(), reinterpret_cast<LPVOID>(base), buf.data(), buf.size(), &wrote);
-            }
             for (HANDLE h : pinned) CloseHandle(h);
-            if (!simply::dump_image(dbg.process_handle(), runtime_image_base, info->image_base, info->size_of_image, oep_va, output, &capture)) {
+            if (!simply::dump_image(*module_snap, std::move(image_snapshot), runtime_image_base, info->image_base, info->size_of_image, oep_va, output, &capture)) {
                 TerminateProcess(dbg.process_handle(), 1);
                 return EXIT_FAILURE;
             }

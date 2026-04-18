@@ -561,6 +561,7 @@ CaptureResult capture_api_landings(void* process_handle, std::uint64_t image_bas
     std::uint32_t resolved = 0;
     const std::size_t total = stub_set.size();
     const DWORD capture_start = GetTickCount();
+    std::uint32_t consecutive_thread_failures = 0;
     for (const auto stub_va : stub_set) {
         if (GetTickCount() > deadline) {
             log::warn("capture: total budget exceeded after {}/{} stubs", resolved, total);
@@ -571,6 +572,7 @@ CaptureResult capture_api_landings(void* process_handle, std::uint64_t image_bas
         if (api_va) {
             out.stub_to_api[stub_va] = api_va;
             ++resolved;
+            consecutive_thread_failures = 0;
             const ModuleRange* mod = find_module(api_va, sys_mods);
             if (mod) {
                 log::debug("capture: stub 0x{:x} -> api 0x{:x} ({}+0x{:x})", stub_va, api_va, mod->name, api_va - mod->base);
@@ -579,6 +581,20 @@ CaptureResult capture_api_landings(void* process_handle, std::uint64_t image_bas
             }
         } else {
             log::warn("capture: stub 0x{:x} unresolved", stub_va);
+            // CreateRemoteThread returning ACCESS_DENIED in a row means the
+            // target is dying (one of our spawned stub threads called something
+            // fatal). bail so we don't spin through the rest of the queue
+            DWORD exit_code = 0;
+            if (GetExitCodeProcess(process, &exit_code) && exit_code != STILL_ACTIVE) {
+                log::warn("capture: target process exited (code 0x{:x}) after {}/{} stubs - bailing",
+                          exit_code, resolved, total);
+                break;
+            }
+            if (++consecutive_thread_failures >= 8) {
+                log::warn("capture: {} consecutive remote-thread failures, target likely dying - bailing after {}/{} stubs",
+                          consecutive_thread_failures, resolved, total);
+                break;
+            }
         }
     }
     log::info("capture: resolved {}/{} stub(s) in {}ms",
